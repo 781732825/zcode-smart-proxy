@@ -395,6 +395,14 @@ func registerModelRoutes(mux *http.ServeMux, zapi *ZCodeAPI) {
 	mux.HandleFunc("/api/v1/ultra/", zapi.HandleMessages)
 	mux.HandleFunc("/api/v1/ultra-zai/", zapi.HandleMessages)
 	mux.HandleFunc("/api/v1/highspeed/", zapi.HandleMessages)
+	// /api/v1/off-peak/anthropic/ 是闲时排队（Idle plan）provider 的推理形状
+	// （zcode-builtin.json：account:{zai,bigmodel}-offpeak-idle-plan 的 baseUrl =
+	// {origin}/api/v1/off-peak/anthropic，3.15.1 起内置），同样子树别名到
+	// HandleMessages；客户端侧票据号 header（x-off-peak-ticket-id）白名单透传，
+	// 闲时专属业务码（3101-3105）按形状透传不惩罚账号。仅推理子树——
+	// /api/v1/off-peak/ticket* 是管理面取票/查票端点，客户端直连官方源站，
+	// 不经本代理也不开认证（绝不留成未认证模型端点）
+	mux.HandleFunc("/api/v1/off-peak/anthropic/", zapi.HandleMessages)
 	// /api/v1/zcode-plan/anthropic 是 zcodePlanAnthropicBaseUrl 的直连形状：
 	// start-plan provider 的 baseUrl 直接 = {origin}/api/v1/zcode-plan/anthropic
 	// （也是本代理 DefaultUpstream 的形状），客户端指向本代理时原样打到该路径

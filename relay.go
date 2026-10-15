@@ -108,10 +108,28 @@ type relayCtx struct {
 	// 耗尽/风控/连接失败等）。与 sawRateLimit 同时为真 = 混合故障：终态按 503
 	// 如实回报，不得谎报成纯过载（轮 4 红队 F4）
 	sawNonRateCooldown bool
+	// specialProto 客户端到达形状标注：闲时排队协议（/api/v1/off-peak/anthropic）
+	// 或高速卡协议（/api/v1/highspeed）。这两个形状的业务码（3101-3105/3402）
+	// 描述客户端计划侧的票据/卡片状态，不是池账号健康信号——失败分类走
+	// 原样透传分支，不惩罚账号（zai-org/ZCode offpeak-retry.ts / highspeed.ts）
+	specialProto string
 }
+
+// specialProto 取值（空串 = 普通形状，无特殊业务码语义）
+const (
+	specialProtoOffPeak   = "offpeak"
+	specialProtoHighspeed = "highspeed"
+)
 
 // HandleMessages POST /v1/messages — 原生 Anthropic 协议
 func (z *ZCodeAPI) HandleMessages(w http.ResponseWriter, r *http.Request) {
+	// 官方网关别名形状（/api/v1/ultra|highspeed|off-peak/anthropic 子树）把
+	// count_tokens 变体一并路由到本 handler；不识别会当成完整生成请求真实计费。
+	// 按count_tokens 端点语义走本地估算（与 Anthropic SDK 的端点探测同规）
+	if strings.HasSuffix(r.URL.Path, "/count_tokens") {
+		z.HandleCountTokens(w, r)
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeAPIError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -144,6 +162,16 @@ func (z *ZCodeAPI) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	rc := &relayCtx{
 		body: body, provider: provider, group: r.Header.Get("x-zcode-group"),
 		proto: protocolAnthropic, clientStream: clientStream, clientModel: model,
+	}
+	// 到达形状决定特殊业务码语义（见 relayCtx.specialProto）：
+	// 3.15.1 起官方客户端的闲时排队（Idle plan）与高速卡（Highspeed card）
+	// provider baseUrl 都是 {origin}/api/v1/<通道>/anthropic，客户端把
+	// ZCODE_BASE_URL 指向本代理时请求原样打到这些路径
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/api/v1/off-peak/anthropic"):
+		rc.specialProto = specialProtoOffPeak
+	case strings.HasPrefix(r.URL.Path, "/api/v1/highspeed"):
+		rc.specialProto = specialProtoHighspeed
 	}
 	z.relay(w, r, rc)
 }
@@ -658,6 +686,22 @@ func (z *ZCodeAPI) forwardOnce(w http.ResponseWriter, r *http.Request, a *Accoun
 				return outcomeRiskBlocked
 			}
 
+			// 闲时排队/高速卡协议业务码：429/3105=排队应答（客户端按
+			// min(Retry-After,5min) 钳制等待后幂等重试，裸 429 同样按排队）、
+			// 400/3102（旧 3001 兼容）=票据过期（客户端同 task 重取号续跑）、
+			// 3101 资格/3103 闲时配额、3402（provider_code 形态）=高速卡过期
+			// （客户端回落原模型）。这些码描述客户端计划侧票据/卡片状态，
+			// 与池账号健康无关：原样透传状态与业务体（含 Retry-After），
+			// 不惩罚账号、不进限流聚合、不解绑粘滞（重取的票据仍绑同一账号）。
+			// 仅对到达形状匹配的请求生效——上游明令这些码不得进全局映射表
+			//（同一批码在其它 bigmodel 接口另有含义）
+			if rc.specialProto != "" && isSpecialProtocolBizCode(rc.specialProto, resp.StatusCode, text) {
+				log.Printf("[relay] account %s %s protocol biz-code passthrough (HTTP %d)", a.DisplayNameOrEmail(), rc.specialProto, resp.StatusCode)
+				z.recordUsage(a, r, payload, resp.StatusCode, start, 0, nil, rc.clientStream)
+				writeUpstreamErrorForProto(w, resp, text, rc.proto)
+				return outcomeUpstreamError
+			}
+
 			switch {
 			case resp.StatusCode == 401 || resp.StatusCode == 403:
 				if channel == ChannelPaid {
@@ -1005,15 +1049,16 @@ func (z *ZCodeAPI) buildUpstreamRequest(a *Account, verifyParam, region string, 
 	// 客户端自己的项目令牌 / coding-plan 凭证（官方客户端 off-peak 模式把前者当首选
 	// apiKey 用，后者即其 reserved-auth 里的 codingPlanAuthorization）——透传会被上游
 	// 优先识别，用量记到客户端账号，被拒时还会误判到池账号头上。上游鉴权只认本代理
-	// 注入的池凭证。x-zcode-query-source（出现源标注，非凭证）与高速卡通道的
-	// 目标/卡片元数据仍透传。
+	// 注入的池凭证。x-zcode-query-source（出现源标注，非凭证）、高速卡通道的
+	// 目标/卡片元数据、闲时排队票据号（客户端按票面对账，重取号续跑依赖它）仍透传。
 	forwardSet := map[string]bool{
 		"accept-language": true, "cache-control": true, "anthropic-beta": true,
 		"anthropic-dangerous-direct-browser-access": true, "traceparent": true,
 		"tracestate": true, "x-client-request-id": true,
-		"x-zcode-query-source": true,
+		"x-zcode-query-source": true, "x-zcode-trace-id": true,
 		"x-highspeed-card-id":  true,
 		"bigmodel-target-type": true, "bigmodel-organization": true, "bigmodel-project": true,
+		"x-off-peak-ticket-id": true,
 	}
 	for k, vals := range r.Header {
 		lk := strings.ToLower(k)
@@ -1118,6 +1163,52 @@ func isExhaustedError(statusCode int, text string) bool {
 func isRiskBlocked(text string) bool {
 	low := strings.ToLower(text)
 	return strings.Contains(low, "unusual activity") || hasBizCode(low, "3012")
+}
+
+// isSpecialProtocolBizCode 闲时/高速卡形状专属业务码识别（forwardOnce 透传分支用）。
+// 语义对齐 zai-org/ZCode 适配层：offpeak 形状收 3105 排队（含裸 429）、3102 票据
+// 不可用、3001 旧网关滚动发布兼容、3101 资格、3103 闲时配额；highspeed 形状收
+// 3402 卡过期（provider_code 形态，键名两种拼写都收）。
+func isSpecialProtocolBizCode(shape string, statusCode int, text string) bool {
+	low := strings.ToLower(text)
+	switch shape {
+	case specialProtoOffPeak:
+		if statusCode == http.StatusTooManyRequests {
+			return true
+		}
+		for _, code := range []string{"3101", "3102", "3103", "3105", "3001"} {
+			if hasBizCode(low, code) {
+				return true
+			}
+		}
+	case specialProtoHighspeed:
+		return hasProviderCode(low, "3402")
+	}
+	return false
+}
+
+// hasProviderCode 精确匹配 provider_code / providerErrorCode 键的业务码：
+// 键后允许空格与开引号，码后必须是非数字边界（与 hasBizCode 同规）
+func hasProviderCode(text, code string) bool {
+	for _, key := range []string{`"provider_code":`, `"providererrorcode":`} {
+		for i := 0; ; {
+			j := strings.Index(text[i:], key)
+			if j < 0 {
+				break
+			}
+			k := i + j + len(key)
+			for k < len(text) && (text[k] == ' ' || text[k] == '"') {
+				k++
+			}
+			if strings.HasPrefix(text[k:], code) {
+				if end := k + len(code); end >= len(text) || text[end] < '0' || text[end] > '9' {
+					return true
+				}
+			}
+			i = k
+		}
+	}
+	return false
 }
 
 // ---- 请求体处理 ----

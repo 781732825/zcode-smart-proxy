@@ -1079,16 +1079,28 @@ func TestGatewayAliasSubtreeVariants(t *testing.T) {
 	for _, path := range []string{
 		"/api/v1/ultra/anthropic/v1/messages",
 		"/api/v1/ultra-zai/anthropic/v1/messages",
-		"/api/v1/ultra-zai/anthropic/v1/messages/count_tokens",
 		"/api/v1/ultra/anthropic/v1/messages/",
 		"/api/v1/highspeed/anthropic/v1/messages",
-		"/api/v1/highspeed/anthropic/v1/messages/count_tokens",
 		"/api/v1/zcode-plan/anthropic/v1/messages",
+		"/api/v1/off-peak/anthropic/v1/messages",
 	} {
 		w := httptest.NewRecorder()
 		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"GLM-5.3","messages":"x"}`)))
 		if w.Code != http.StatusBadRequest {
 			t.Fatalf("%s → status %d, want 400 from HandleMessages; body=%s", path, w.Code, w.Body.String())
+		}
+	}
+	// count_tokens 变体自 3.15.3 波次（2026-10-16）起走本地估算端点：原先进
+	// HandleMessages 会把计数请求当完整生成真实计费
+	for _, path := range []string{
+		"/api/v1/ultra-zai/anthropic/v1/messages/count_tokens",
+		"/api/v1/highspeed/anthropic/v1/messages/count_tokens",
+		"/api/v1/off-peak/anthropic/v1/messages/count_tokens",
+	} {
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"model":"GLM-5.3","messages":"x"}`)))
+		if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), "input_tokens") {
+			t.Fatalf("%s → status %d, want 200 from HandleCountTokens; body=%s", path, w.Code, w.Body.String())
 		}
 	}
 	// 非 ultra 的 /api/* 仍 404（不得吞掉管理面路由）

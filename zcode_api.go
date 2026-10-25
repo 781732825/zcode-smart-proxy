@@ -50,6 +50,11 @@ type ZCodeAPI struct {
 
 	asyncRotation atomic.Int64 // 闲时通道轮转起点（并发请求分摊账号）
 
+	hsMu             sync.Mutex
+	hsCards          map[int64]*highspeedCard // 账号 → 在手高速卡面（highspeed.go）
+	hsDrawBlockUntil map[int64]time.Time      // 账号 → 取卡失败后 lane 静默期
+	hsDrawing        map[int64]bool           // 账号 → 取卡进行中（并发请求直接落回，不排队）
+
 	tokenRefreshInflight sync.Map // 账号ID → refresh_token 兑换中（单飞）
 }
 
@@ -99,16 +104,19 @@ func (z *ZCodeAPI) WaitBackground(maxWait time.Duration) {
 // NewZCodeAPI 创建上游 API 封装，并把额度刷新函数注入账号池
 func NewZCodeAPI(cfg *FileConfig, db *DB, pool *AccountPool, captcha *CaptchaService, appVersion string) *ZCodeAPI {
 	z := &ZCodeAPI{
-		cfg:         cfg,
-		db:          db,
-		pool:        pool,
-		captcha:     captcha,
-		egress:      NewEgressProxy(db),
-		routing:     NewEndpointRouter(""),
-		appVersion:  appVersion,
-		claimLocks:  make(map[int64]*sync.Mutex),
-		resetSyncAt: make(map[int64]time.Time),
-		refreshAt:   make(map[int64]time.Time),
+		cfg:              cfg,
+		db:               db,
+		pool:             pool,
+		captcha:          captcha,
+		egress:           NewEgressProxy(db),
+		routing:          NewEndpointRouter(""),
+		appVersion:       appVersion,
+		claimLocks:       make(map[int64]*sync.Mutex),
+		resetSyncAt:      make(map[int64]time.Time),
+		refreshAt:        make(map[int64]time.Time),
+		hsCards:          make(map[int64]*highspeedCard),
+		hsDrawBlockUntil: make(map[int64]time.Time),
+		hsDrawing:        make(map[int64]bool),
 	}
 	pool.SetQuotaFetcher(func(a *Account) error {
 		err := z.RefreshAccountQuota(a)

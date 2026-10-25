@@ -61,6 +61,8 @@ func (s *APIServer) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /api/accounts/oauth/manual", s.handleOAuthManual)
 	mux.HandleFunc("GET /api/accounts/oauth/status", s.handleOAuthStatus)
 	mux.HandleFunc("GET /api/offpeak/availability", s.handleOffpeakAvailability)
+	// 高速卡 lane 状态视图（只读：缓存卡面 + 取卡静默期；不触发 draw）
+	mux.HandleFunc("GET /api/highspeed/status", s.handleHighspeedStatus)
 	mux.HandleFunc("POST /api/accounts/{id}/refresh", s.handleAccountRefresh)
 	mux.HandleFunc("POST /api/accounts/{id}/claim", s.handleAccountClaim)
 	mux.HandleFunc("POST /api/accounts/{id}/detect", s.handleAccountDetect)
@@ -413,6 +415,12 @@ func (s *APIServer) handleOffpeakAvailability(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": false, "error": "无可用 JWT 账号"})
+}
+
+// handleHighspeedStatus 高速卡 lane 状态视图（只读：缓存卡面 + 取卡静默期；
+// 绝不触发 draw——那是计费侧资源）
+func (s *APIServer) handleHighspeedStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, s.zapi.highspeedLaneStatus())
 }
 
 func (s *APIServer) handleAccountRefresh(w http.ResponseWriter, r *http.Request) {
@@ -888,6 +896,8 @@ var settingsWhitelist = map[string]bool{
 	// 闲时免费通道（off-peak ticket queue）
 	"async_enabled": true, "async_poll_interval_ms": true,
 	"async_keepalive_ms": true, "async_max_retries": true, "async_max_wait_sec": true,
+	// 高速卡通道（highspeed card lane；取卡消耗计划侧资源，默认关）
+	"highspeed_lane_enabled": true,
 	// 用量记录保留天数（0=永久；每 6h 清扫一次）
 	"usage_retention_days": true,
 	// 网关全局暂停（panic stop）：1 = 数据面拒绝所有转发请求

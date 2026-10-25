@@ -173,6 +173,15 @@ func (z *ZCodeAPI) HandleMessages(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(r.URL.Path, "/api/v1/highspeed"):
 		rc.specialProto = specialProtoHighspeed
 	}
+	// 高速卡 lane（highspeed_lane_enabled=1，默认关）：优先真实高速卡上游
+	// （池账号取卡 → 带卡转发，协议对齐官方 draw/healthy/messages 三件套），
+	// 任何未写字节的失败原样落回下方常规通道转发（官方 SingleAttempt→degrade
+	// 语义）。lane 自己补齐暂停闸 + 命名 Key 限流闸，账号惩罚规则见 highspeed.go
+	if rc.specialProto == specialProtoHighspeed && z.highspeedLaneEnabled() {
+		if z.highspeedLane(w, r, rc) {
+			return
+		}
+	}
 	z.relay(w, r, rc)
 }
 
